@@ -1,0 +1,487 @@
+import copy
+from dataclasses import dataclass, field, fields, asdict
+import json
+import logging
+import pathlib
+from typing import Dict, Optional, Sequence, List
+import sys
+import torch
+
+import transformers
+
+from llava_pythia.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, \
+    DEFAULT_IM_END_TOKEN
+from torch.utils.data import DataLoader, Dataset, Subset
+from llava_pythia.train.llava_pythia_trainer import LLaVAPythiaTrainer
+
+from llava_pythia import conversation as conversation_lib
+from llava_pythia.model import *
+from llava_pythia.mm_utils import tokenizer_image_token
+from transformers import CLIPVisionConfig, SiglipVisionConfig, CLIPImageProcessor, SiglipImageProcessor
+from PIL import Image
+import numpy as np
+import os
+
+def _tokenize_fn(strings: Sequence[str],
+                 tokenizer: transformers.PreTrainedTokenizer) -> Dict:
+    """对字符串列表进行分词处理
+    Args:
+        strings: 需要分词的文本列表
+        tokenizer: 预训练的分词器
+        
+    Returns:
+        包含以下内容的字典:
+        - input_ids: 分词后的输入ID列表
+        - labels: 同input_ids（用于语言模型训练）
+        - input_ids_lens: 每个输入的实际长度（排除填充）
+        - labels_lens: 同input_ids_lens
+    """
+    tokenized_list = [
+        tokenizer(
+            text,
+            return_tensors="pt",
+            padding="longest",  # 动态填充到批次中最长序列
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+        ) for text in strings
+    ]
+    input_ids = labels = [
+        tokenized.input_ids[0] for tokenized in tokenized_list
+    ]
+    input_ids_lens = labels_lens = [
+        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item()  # 计算非填充token的数量
+        for tokenized in tokenized_list
+    ]
+    return dict(
+        input_ids=input_ids,
+        labels=labels,
+        input_ids_lens=input_ids_lens,
+        labels_lens=labels_lens,
+    )
+
+
+def _mask_targets(target, tokenized_lens, speakers):
+    """掩码目标序列中的特定部分
+    Args:
+        target: 需要掩码的目标序列
+        tokenized_lens: 每个部分的token长度列表
+        speakers: 说话者角色列表（human/gpt）
+    """
+    cur_idx = tokenized_lens[0]  # 跳过第一个序列（系统提示）
+    target[:cur_idx] = IGNORE_INDEX  # 掩码系统提示部分
+    for tokenized_len, speaker in zip(tokenized_lens[1:], speakers):
+        if speaker == "human":
+            target[cur_idx+2:cur_idx+tokenized_len] = IGNORE_INDEX  # 掩码人类回复的内容部分
+        cur_idx += tokenized_len
+
+
+def _add_speaker_and_signal(header, source, get_conversation=True):
+    """为对话添加说话者和开始/结束标记
+    Args:
+        header: 对话系统提示
+        source: 原始对话数据
+        get_conversation: 是否返回完整拼接的对话
+    Returns:
+        格式化后的对话字符串
+    """
+    BEGIN_SIGNAL = "### "
+    END_SIGNAL = "\n"
+    conversation = header
+    for sentence in source:
+        from_str = sentence["from"]
+        # 统一角色名称
+        if from_str.lower() == "human":
+            from_str = conversation_lib.default_conversation.roles[0]
+        elif from_str.lower() == "gpt":
+            from_str = conversation_lib.default_conversation.roles[1]
+        else:
+            from_str = 'unknown'
+        # 添加对话标记
+        sentence["value"] = (BEGIN_SIGNAL + from_str + ": " +
+                             sentence["value"] + END_SIGNAL)
+        if get_conversation:
+            conversation += sentence["value"]
+    conversation += BEGIN_SIGNAL  # 添加最终开始标记
+    return conversation
+
+
+def preprocess_multimodal(
+        sources: Sequence[str],
+        data_args,
+) -> Dict:
+    """预处理多模态数据（文本+图像）
+    Args:
+        sources: 原始对话数据
+        data_args: 包含配置参数的对象
+    Returns:
+        处理后的对话数据，包含格式化后的图像标记
+    """
+    is_multimodal = data_args.is_multimodal
+    if not is_multimodal:
+        return sources
+
+    for source in sources:
+        for sentence in source:
+            if DEFAULT_IMAGE_TOKEN in sentence['value']:
+                # 清理图像标记周围的空格
+                sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '').strip()
+                sentence['value'] = DEFAULT_IMAGE_TOKEN + '\n' + sentence['value']
+                sentence['value'] = sentence['value'].strip()
+            # 根据配置添加图像开始/结束标记
+            replace_token = DEFAULT_IMAGE_TOKEN
+            if data_args.mm_use_im_start_end:
+                replace_token = DEFAULT_IM_START_TOKEN + replace_token + DEFAULT_IM_END_TOKEN
+            sentence["value"] = sentence["value"].replace(DEFAULT_IMAGE_TOKEN, replace_token)
+
+    return sources
+
+
+def preprocess_v0(
+        sources,
+        tokenizer: transformers.PreTrainedTokenizer,
+        has_image: bool = False
+) -> Dict:
+    """预处理对话数据（v0版本格式）
+    Args:
+        sources: 原始对话数据
+        tokenizer: 分词器
+        has_image: 是否包含图像
+    Returns:
+        包含input_ids和labels的字典
+    """
+    conv = conversation_lib.default_conversation.copy()
+    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+
+    # 构建完整对话提示
+    conversations = []
+    for i, source in enumerate(sources):
+        if roles[source[0]["from"]] != conv.roles[0]:
+            source = source[1:]  # 跳过第一个非人类发言
+
+        conv.messages = []
+        for j, sentence in enumerate(source):
+            role = roles[sentence["from"]]
+            assert role == conv.roles[j % 2], f"{i}"  # 验证对话轮次正确性
+            conv.append_message(role, sentence["value"])
+        conversations.append(conv.get_prompt())  # 获取格式化后的对话提示
+
+    # 分词处理
+    if has_image:
+        input_ids = torch.stack(
+            [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+    else:
+        input_ids = tokenizer(
+            conversations,
+            return_tensors="pt",
+            padding="longest",
+            max_length=tokenizer.model_max_length,
+            truncation=True,
+        ).input_ids
+
+    targets = input_ids.clone()
+
+    # 掩码处理（仅保留模型回复部分作为监督信号）
+    sep = conv.sep + conv.roles[1] + ": "
+    for conversation, target in zip(conversations, targets):
+        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+        if 'phi' in tokenizer.name_or_path.lower():
+            total_len +=1  # phi模型特殊处理
+        rounds = conversation.split(conv.sep2)  # 分割对话轮次
+        
+        cur_len = 0
+        target[:cur_len] = IGNORE_INDEX  # 掩码初始部分
+        
+        for rou in rounds:
+            if rou == "":
+                break
+            # 分割人类和模型回复
+            parts = rou.split(sep)
+            if len(parts) != 2:
+                break
+            parts[0] += sep
+            
+            # 计算各部分长度
+            if has_image:
+                round_len = len(tokenizer_image_token(rou, tokenizer)) + 1
+                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 1
+            else:
+                round_len = len(tokenizer(rou).input_ids) + 1
+                instruction_len = len(tokenizer(parts[0]).input_ids) - 1
+            
+            # 掩码人类指令部分
+            target[cur_len: cur_len + instruction_len] = IGNORE_INDEX
+            cur_len += round_len
+        
+        # 掩码填充部分
+        target[cur_len:] = IGNORE_INDEX
+
+        # 长度验证
+        if cur_len < tokenizer.model_max_length and cur_len != total_len:
+            print(f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}")
+
+    return dict(input_ids=input_ids, labels=targets)
+
+
+def preprocess_plain(
+        sources: Sequence[str],
+        tokenizer: transformers.PreTrainedTokenizer,
+) -> Dict:
+    """预处理纯文本对话格式
+    Args:
+        sources: 包含两轮对话的数据
+        tokenizer: 分词器
+    Returns:
+        包含input_ids和labels的字典
+    """
+    conversations = []
+    for source in sources:
+        assert len(source) == 2
+        assert DEFAULT_IMAGE_TOKEN in source[0]['value']
+        source[0]['value'] = DEFAULT_IMAGE_TOKEN  # 标准化图像标记
+        conversation = source[0]['value'] + source[1]['value'] + conv.sep
+        conversations.append(conversation)
+    
+    # 分词并掩码图像标记部分
+    input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
+    targets = copy.deepcopy(input_ids)
+    for target, source in zip(targets, sources):
+        tokenized_len = len(tokenizer_image_token(source[0]['value'], tokenizer))
+        target[:tokenized_len] = IGNORE_INDEX  # 掩码图像标记部分
+
+    return dict(input_ids=input_ids, labels=targets)
+
+
+def preprocess(
+        sources: Sequence[str],
+        tokenizer: transformers.PreTrainedTokenizer,
+        has_image: bool = False
+) -> Dict:
+    """预处理入口函数
+    Args:
+        sources: 原始对话数据
+        tokenizer: 分词器
+        has_image: 是否包含图像
+    Returns:
+        处理后的数据字典
+    """
+    # 根据对话格式选择预处理方式
+    if conv.sep_style == conversation_lib.SeparatorStyle.PLAIN:
+        return preprocess_plain(sources, tokenizer)
+    elif conv.version.startswith("v0"):
+        return preprocess_v0(sources, tokenizer, has_image=has_image)
+    else:
+        raise ValueError(f"Invalid version: {conv.version}")
+
+
+class LazySupervisedDataset(Dataset):
+    """惰性加载的监督式对话数据集"""
+    def __init__(self, data_path: str,
+                 tokenizer: transformers.PreTrainedTokenizer,
+                 data_type: str,
+                 data_ratio: int,
+                 concat: str,
+                 data_args,):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.data_args = data_args
+        self.concat = concat  # 图像拼接方式
+        
+        # 加载原始数据
+        self.list_data_dict = json.load(open(data_path, "r"))
+        
+        # 初始化图像处理器
+        image_file = self.list_data_dict[0]['image']
+        image_folder = data_args.image_folder
+        self.processor = data_args.image_processor
+
+    def __len__(self):
+        return len(self.list_data_dict)
+
+    def parse_image(self, i, image_file):
+        """解析图像文件并进行预处理
+        Args:
+            image_file: 图像路径或张量
+        Returns:
+            预处理后的图像张量
+        """
+        if isinstance(image_file, str):
+            image = Image.open(os.path.join(self.data_args.image_folder, image_file)).convert('RGB')
+        elif isinstance(image_file, torch.Tensor):
+            image = Image.fromarray(image_file.numpy())
+        
+        # 长宽比处理（填充为正方形）
+        if self.data_args.image_aspect_ratio == 'pad':
+            def expand2square(pil_img, background_color):
+                width, height = pil_img.size
+                if width == height:
+                    return pil_img
+                # 用平均颜色填充
+                new_size = (max(width, height), max(width, height))
+                new_image = Image.new(pil_img.mode, new_size, background_color)
+                paste_position = ((new_size[0]-width)//2, (new_size[1]-height)//2)
+                new_image.paste(pil_img, paste_position)
+                return new_image
+            
+            image = expand2square(image, tuple(int(x*255) for x in self.processor.image_mean))
+        
+        # 使用图像处理器进行标准化处理
+        return self.processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+
+    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        """获取单个样本"""
+        source = self.list_data_dict[i]
+        # 提取机器人状态和动作（如果存在）
+        state = source.get('state', None)
+        action = source.get('action', None)
+        
+        # 处理多模态数据
+        if 'image' in source:
+            # 加载并处理左右图像（如果配置）
+            image = self.parse_image(i, source['image'])
+            if self.concat != 'single':
+                right_image_path = source['image'].replace('left_cap2', 'right_cap2')
+                image_r = self.parse_image(i, right_image_path)
+            
+            # 预处理对话中的图像标记
+            sources = preprocess_multimodal([source["conversations"]], self.data_args)
+        else:
+            sources = [source["conversations"]]
+        
+        # 文本预处理
+        data_dict = preprocess(
+            sources,
+            self.tokenizer,
+            has_image=('image' in source)
+        )
+        
+        # 构建最终数据字典
+        result_dict = {
+            'input_ids': data_dict["input_ids"][0],
+            'labels': data_dict["labels"][0]
+        }
+        
+        # 添加图像数据
+        if 'image' in source:
+            result_dict['image'] = image
+            if self.concat != 'single':
+                result_dict['image_r'] = image_r
+        elif self.data_args.is_multimodal:
+            # 创建空白图像占位符
+            crop_size = self.processor.crop_size
+            result_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+        
+        # 添加机器人数据
+        if state is not None and action is not None:
+            result_dict.update({
+                'state': torch.tensor(state),
+                'action': torch.tensor(action),
+                'is_pad': False  # 标记有效数据
+            })
+        else:
+            result_dict['is_pad'] = True  # 标记填充数据
+
+        return result_dict
+
+
+@dataclass
+class DataCollatorForSupervisedDataset:
+    """监督式数据整理器
+    功能：
+    1. 动态填充文本序列
+    2. 对齐图像数据
+    3. 处理机器人状态和动作
+    """
+    tokenizer: transformers.PreTrainedTokenizer
+
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        # 文本序列填充
+        input_ids = [instance["input_ids"] for instance in instances]
+        labels = [instance["labels"] for instance in instances]
+        
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids,
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id
+        )
+        labels = torch.nn.utils.rnn.pad_sequence(
+            labels,
+            batch_first=True,
+            padding_value=IGNORE_INDEX
+        )
+        
+        # 截断到模型最大长度
+        input_ids = input_ids[:, :self.tokenizer.model_max_length]
+        labels = labels[:, :self.tokenizer.model_max_length]
+
+        # 处理机器人数据
+        states = torch.stack([instance.get('state', torch.zeros(7)) for instance in instances])
+        actions = torch.stack([instance.get('action', torch.zeros(7)) for instance in instances])
+        is_pad = torch.tensor([instance.get('is_pad', True) for instance in instances])
+
+        # 构建基础批次字典
+        batch = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": input_ids.ne(self.tokenizer.pad_token_id),
+            "states": states,
+            "actions": actions,
+            "is_pad": is_pad
+        }
+
+        # 处理图像数据
+        if 'image' in instances[0]:
+            images = []
+            images_r = []
+            for instance in instances:
+                if 'image' in instance:
+                    images.append(instance['image'])
+                    if 'image_r' in instance:
+                        images_r.append(instance['image_r'])
+            
+            # 对齐不同尺寸图像（如有）
+            if all(img.shape == images[0].shape for img in images):
+                batch["images"] = torch.stack(images)
+                if images_r:
+                    batch["images_r"] = torch.stack(images_r)
+            else:
+                batch["images"] = images  # 保持列表形式
+        
+        # 处理数值异常
+        for key in ['actions', 'images', 'images_r']:
+            if key in batch:
+                batch[key] = torch.nan_to_num(batch[key])
+
+        return batch
+
+
+def make_supervised_data_module(tokenizer, data_args, concat="None") -> Dict:
+    """创建数据模块
+    返回：
+    - 训练/验证数据集
+    - 数据整理器
+    """
+    # 创建数据集
+    train_dataset = LazySupervisedDataset(
+        tokenizer=tokenizer,
+        data_path=data_args.data_path,
+        data_type='train',
+        data_args=data_args,
+        concat=concat
+    )
+    
+    eval_dataset = LazySupervisedDataset(
+        tokenizer=tokenizer,
+        data_path=data_args.data_path.replace('train', 'eval'),
+        data_type='eval',
+        data_args=data_args,
+        concat=concat
+    )
+
+    # 初始化数据整理器
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+
+    return {
+        "train_dataset": train_dataset,
+        "eval_dataset": eval_dataset,
+        "data_collator": data_collator
+    }
