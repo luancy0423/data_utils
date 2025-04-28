@@ -1,0 +1,211 @@
+import numpy as np
+import torch
+import os
+import h5py
+import pickle
+import fnmatch
+import cv2
+from time import time
+from torch.utils.data import TensorDataset, DataLoader
+import torchvision.transforms as transforms
+
+class EpisodicDataset(torch.utils.data.Dataset):
+    """支持加载多摄像头图像、动作和机器人状态的时间序列数据集"""
+    def __init__(self, dataset_path_list, camera_names, norm_stats, episode_ids, episode_len, chunk_size, policy_class, llava_pythia_process=None, imsize=480):
+        """
+        参数说明：
+        dataset_path_list: 数据集hdf5文件路径列表
+        camera_names: 使用的摄像头名称列表（如['top','left','right']）
+        norm_stats: 归一化统计量字典（包含动作和状态的均值和标准差）
+        episode_ids: 每个数据文件的唯一标识列表
+        episode_len: 每个episode的时间步长列表
+        chunk_size: 每个样本包含的连续时间步数
+        policy_class: 策略类型（如ACT或diffusion）
+        imsize: 图像缩放尺寸
+        """
+        # 初始化基础参数
+        self.dataset_path_list = dataset_path_list
+        self.camera_names = camera_names
+        self.norm_stats = norm_stats
+        self.episode_ids = episode_ids
+        self.episode_len = episode_len
+        self.chunk_size = chunk_size
+        self.cumulative_len = np.cumsum(episode_len)  # 累积时间步长用于索引定位
+        self.policy_class = policy_class
+        self.imsize = imsize
+        
+        # 数据增强配置
+        self.transformations = [
+            transforms.RandomCrop(size=[int(imsize*0.95), int(imsize*0.95)]),
+            transforms.Resize((imsize, imsize)),
+            transforms.RandomRotation(degrees=5),
+            transforms.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5)
+        ] if 'diffusion' in policy_class else None
+        
+        # 初始化缓存检测
+        self.__getitem__(0)  # 触发初始化，检查数据格式
+
+    def __len__(self):
+        """返回数据集总时间步数"""
+        return sum(self.episode_len)
+
+    def _locate_transition(self, index):
+        """定位索引对应的具体episode和时间点"""
+        episode_idx = np.searchsorted(self.cumulative_len, index, side='right')
+        start_ts = index - (self.cumulative_len[episode_idx-1] if episode_idx>0 else 0)
+        return self.episode_ids[episode_idx], start_ts
+
+    def __getitem__(self, index):
+        """核心数据加载方法，返回处理后的样本"""
+        # 定位具体数据文件和时间点
+        episode_id, start_ts = self._locate_transition(index)
+        dataset_path = self.dataset_path_list[episode_id]
+        
+        # 从HDF5文件加载原始数据
+        with h5py.File(dataset_path, 'r') as root:
+            # 读取动作和观测数据
+            action = root['/action'][start_ts:start_ts+self.chunk_size]
+            qpos = root['/observations/qpos'][start_ts]
+            
+            # 加载多摄像头图像
+            image_dict = {}
+            for cam in self.camera_names:
+                img = root[f'/observations/images/{cam}'][start_ts]
+                if img.shape[1] != self.imsize:
+                    img = cv2.resize(img, (self.imsize, int(self.imsize*0.75)))  # 调整图像尺寸
+                image_dict[cam] = img
+
+        # 数据预处理流水线
+        processed_data = {
+            'images': self._process_images(list(image_dict.values())),
+            'qpos': self._normalize_qpos(qpos),
+            'action': self._normalize_action(action),
+            'is_pad': self._generate_padding_mask(action)
+        }
+        
+        # 根据策略类型返回不同格式
+        return processed_data if 'diffusion' in self.policy_class else self._format_for_ACT(processed_data)
+
+    def _process_images(self, images):
+        """图像处理流程：BGR转RGB -> 归一化 -> 数据增强"""
+        # 转换颜色空间
+        rgb_images = [cv2.cvtColor(img, cv2.COLOR_BGR2RGB) for img in images]
+        # 转换为PyTorch张量
+        tensor_images = torch.stack([torch.from_numpy(img) for img in rgb_images])
+        # 应用数据增强
+        if self.transformations:
+            for transform in self.transformations:
+                tensor_images = transform(tensor_images)
+        return tensor_images.float() / 255.0  # 归一化到[0,1]
+
+    def _normalize_qpos(self, qpos):
+        """机器人状态归一化"""
+        return (qpos - self.norm_stats['qpos_mean']) / self.norm_stats['qpos_std']
+
+    def _normalize_action(self, action):
+        """动作数据归一化（支持两种策略）"""
+        if 'diffusion' in self.policy_class:
+            # 扩散模型归一化到[-1,1]
+            return 2 * (action - self.norm_stats['action_min']) / \
+                  (self.norm_stats['action_max'] - self.norm_stats['action_min']) - 1
+        else:
+            # ACT模型标准化
+            return (action - self.norm_stats['action_mean']) / self.norm_stats['action_std']
+
+    def _generate_padding_mask(self, action):
+        """生成填充掩码（处理不等长序列）"""
+        pad_len = max(0, self.chunk_size - len(action))
+        return torch.cat([torch.zeros(len(action)), torch.ones(pad_len)], dim=0).bool()
+
+class LlavaPythiaProcess:
+    """处理多模态数据（图像+语言）准备模型输入"""
+    def __init__(self, tokenizer, image_processor):
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        
+    def process_sample(self, sample):
+        """处理单个样本：图像预处理 + 文本标记化"""
+        # 图像预处理（调整大小、标准化）
+        processed_images = [self.image_processor(img) for img in sample['images']]
+        
+        # 构造对话格式
+        conversation = [
+            {"role": "human", "content": f"<image>\n{sample['instruction']}"},
+            {"role": "assistant", "content": " "}
+        ]
+        
+        # 文本标记化
+        tokenized = self.tokenizer(
+            conversation,
+            padding='max_length',
+            truncation=True,
+            max_length=512,
+            return_tensors='pt'
+        )
+        
+        return {
+            'input_ids': tokenized['input_ids'],
+            'attention_mask': tokenized['attention_mask'],
+            'images': torch.stack(processed_images)
+        }
+
+def get_norm_stats(dataset_paths):
+    """计算数据集归一化统计量"""
+    all_actions, all_qpos = [], []
+    for path in dataset_paths:
+        with h5py.File(path, 'r') as f:
+            all_actions.append(f['/action'][:])
+            all_qpos.append(f['/observations/qpos'][:])
+    
+    # 合并所有数据
+    actions = np.concatenate(all_actions)
+    qpos = np.concatenate(all_qpos)
+    
+    # 计算统计量
+    stats = {
+        'action_mean': actions.mean(axis=0),
+        'action_std': np.clip(actions.std(axis=0), 1e-2, None),
+        'action_min': actions.min(axis=0),
+        'action_max': actions.max(axis=0),
+        'qpos_mean': qpos.mean(axis=0),
+        'qpos_std': np.clip(qpos.std(axis=0), 1e-2, None)
+    }
+    return stats
+
+def load_dataset(config):
+    """加载训练和验证数据集"""
+    # 查找所有HDF5文件
+    data_files = []
+    for root, _, files in os.walk(config['data_dir']):
+        data_files += [os.path.join(root, f) for f in files if f.endswith('.hdf5')]
+    
+    # 划分训练验证集
+    np.random.shuffle(data_files)
+    split_idx = int(len(data_files) * config['train_ratio'])
+    train_files, val_files = data_files[:split_idx], data_files[split_idx:]
+    
+    # 计算归一化统计量
+    norm_stats = get_norm_stats(train_files)
+    
+    # 创建数据集实例
+    train_set = EpisodicDataset(train_files, config['cameras'], norm_stats, 
+                              np.arange(len(train_files)), [200]*len(train_files),  # 假设每个episode 200步
+                              config['chunk_size'], config['policy_type'])
+    
+    val_set = EpisodicDataset(val_files, config['cameras'], norm_stats,
+                            np.arange(len(val_files)), [200]*len(val_files),
+                            config['chunk_size'], config['policy_type'])
+    
+    return train_set, val_set, norm_stats
+
+# 辅助工具函数
+def compute_dict_mean(dict_list):
+    """计算字典列表中各键的平均值"""
+    return {k: np.mean([d[k] for d in dict_list]) for k in dict_list[0]}
+
+def set_seed(seed):
+    """设置随机种子保证可重复性"""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
