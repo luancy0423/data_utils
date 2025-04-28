@@ -1,0 +1,231 @@
+import itertools
+import os
+import os.path as osp
+import time
+from collections import OrderedDict, defaultdict
+from datetime import datetime
+from tqdm import tqdm
+
+import h5py  # HDF5文件操作库
+import torch  # PyTorch深度学习框架
+import collections  # 集合模块
+import tensorflow_datasets as tfds  # TensorFlow数据集
+import numpy as np  # 数值计算库
+import argparse  # 命令行参数解析
+
+def get_image_list_np(img_rgb_dir_path, remove_index_list):
+    """
+    加载指定目录下的所有RGB图像并转换为numpy数组
+    Args:
+        img_rgb_dir_path: 图像目录路径
+        remove_index_list: 需要跳过的图像索引列表
+    Returns:
+        cur_camera_rgb_np: 图像numpy数组 (N, H, W, C)
+    """
+    cur_camera_rgb_list = []
+    img_name_list = sorted(os.listdir(img_rgb_dir_path))  # 获取排序后的文件名列表
+
+    for idx, img_name in enumerate(img_name_list):
+        if idx in remove_index_list:
+            continue
+
+        img_path = os.path.join(img_rgb_dir_path, img_name)
+        img_frame = Image.open(img_path).convert('RGB')  # 加载并转换RGB格式
+        img_np = np.array(img_frame)  # PIL图像转numpy
+        cur_camera_rgb_list.append(img_np)
+
+    cur_camera_rgb_np = np.array(cur_camera_rgb_list)
+    print(f'加载图像完成，路径: {img_rgb_dir_path}，形状: {cur_camera_rgb_np.shape}')
+    return cur_camera_rgb_np
+
+def plot_smooth_action(traj_act_xyz_np, fig_name):
+    """
+    可视化动作轨迹的XYZ分量变化
+    Args:
+        traj_act_xyz_np: 动作轨迹numpy数组 (N, 3)
+        fig_name: 输出图片名称
+    """
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(12, 4))
+    components = ["X", "Y", "Z"]
+    
+    # 绘制三个子图分别显示XYZ分量
+    for i in range(3):
+        plt.subplot(1, 3, i+1)
+        plt.plot(traj_act_xyz_np[:, i], label='动作轨迹')
+        plt.title(components[i])
+        plt.legend()
+    
+    # 保存可视化结果
+    plt.suptitle("动作轨迹XYZ分量可视化")
+    plt.tight_layout()
+    os.makedirs("./smooth_action_results", exist_ok=True)
+    plt.savefig(f"./smooth_action_results/{fig_name}.png")
+    plt.clf()
+
+def print_h5_structure(group, indent=0):
+    """
+    递归打印HDF5文件结构
+    Args:
+        group: HDF5文件或组对象
+        indent: 缩进级别（用于美化输出）
+    """
+    for name in group:
+        item = group[name]
+        print(" " * indent + f"名称: {name}")
+        if isinstance(item, h5py.Group):
+            print(" " * indent + "组类型")
+            print_h5_structure(item, indent+2)
+        elif isinstance(item, h5py.Dataset):
+            print(f" 数据集 | 形状: {item.shape} 类型: {item.dtype}")
+
+def convert_h5py2np_dict(group, state_np_dict, indent=0):
+    """
+    将HDF5文件内容转换为嵌套字典结构
+    Args:
+        group: HDF5组对象
+        state_np_dict: 存储结果的字典
+        indent: 缩进级别
+    """
+    for name in group:
+        item = group[name]
+        if isinstance(item, h5py.Group):
+            state_np_dict[name] = {}
+            convert_h5py2np_dict(item, state_np_dict[name], indent+2)
+        else:
+            state_np_dict[name] = item[()]  # 将数据集转换为numpy数组
+
+def generate_h5(obs_replay, action_replay, cfg, total_traj_cnt, act_root_dir_path, edit_flag):
+    """
+    生成HDF5格式数据集文件
+    Args:
+        obs_replay: 观测数据字典，包含qpos、qvel和图像
+        action_replay: 动作数据numpy数组
+        cfg: 配置文件字典
+        total_traj_cnt: 轨迹编号
+        act_root_dir_path: 输出目录路径
+        edit_flag: 编辑标记
+    """
+    # 构建数据字典
+    data_dict = {
+        '/observations/qpos': obs_replay['qpos'],
+        '/observations/qvel': obs_replay['qvel'],
+        '/action': action_replay,
+        'is_edited': np.array(edit_flag)
+    }
+    # 添加多摄像头图像数据
+    for cam_name in cfg['camera_names']:
+        data_dict[f'/observations/images/{cam_name}'] = obs_replay['images'][cam_name]
+
+    # 创建HDF5文件
+    dataset_path = os.path.join(act_root_dir_path, f'episode_{total_traj_cnt}')
+    with h5py.File(dataset_path + '.hdf5', 'w') as root:
+        root.attrs['sim'] = True  # 添加仿真标记属性
+        
+        # 创建观测数据组
+        obs = root.create_group('observations')
+        images = obs.create_group('images')
+        
+        # 创建各摄像头数据集
+        for cam_name in cfg['camera_names']:
+            images.create_dataset(
+                cam_name, 
+                shape=(len(obs_replay['qpos']), cfg['cam_height'], cfg['cam_width'], 3),
+                dtype='uint8',
+                chunks=(1, cfg['cam_height'], cfg['cam_width'], 3)  # 分块存储优化读取
+            )
+        
+        # 创建其他数据集
+        obs.create_dataset('qpos', data=obs_replay['qpos'])
+        obs.create_dataset('qvel', data=obs_replay['qvel'])
+        root.create_dataset('action', data=action_replay)
+        root.create_dataset('is_edited', data=edit_flag)
+        
+        # 添加语言指令
+        root.create_dataset("language_raw", data=[cfg['lang_intrs']])
+
+        # 写入所有数据
+        for name, array in data_dict.items():
+            root[name][...] = array
+
+# 配置参数
+cfg = {
+    "task_name": "droid_box_lang",
+    "camera_names": ["left", "right"],  # 使用左右双摄像头
+    "dataset_dir": "./datasets",
+    "cam_height": 180,    # 图像高度
+    "cam_width": 320,     # 图像宽度
+    "state_dim": 7,       # 状态维度（7自由度机械臂）
+    "action_dim": 10,     # 动作维度（位置+旋转+夹爪）
+    "lang_intrs": '关闭盒子盖子'  # 默认语言指令
+}
+
+if __name__ == "__main__":
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description='RLDS转HDF5转换工具')
+    parser.add_argument("--src_root", default='/data/rlds', help="源数据根目录")
+    parser.add_argument("--name", default="droid", help="数据集名称")
+    args = parser.parse_args()
+
+    # 初始化参数
+    act_target_root = os.path.join(args.src_root, "converted")
+    os.makedirs(act_target_root, exist_ok=True)
+    
+    # 处理平滑参数
+    smooth_window_size = 5  # 滑动窗口大小
+    smooth_order = 2        # 平滑阶数
+
+    # 创建输出目录
+    act_root_dir_name = f'{cfg["task_name"]}_s{smooth_window_size}-{smooth_order}'
+    act_root_dir_path = os.path.join(act_target_root, act_root_dir_name)
+    os.makedirs(act_root_dir_path, exist_ok=True)
+
+    # 加载TFDS数据集
+    ds = tfds.load(args.name, data_dir=args.src_root, split="train")
+    
+    total_traj_cnt = 0
+    for episode in tqdm(ds, desc="处理轨迹"):
+        # 跳过已存在文件
+        if os.path.exists(os.path.join(act_root_dir_path, f'episode_{total_traj_cnt}.hdf5')):
+            total_traj_cnt += 1
+            continue
+
+        # 初始化数据容器
+        state_data = {
+            'qpos': [],
+            'qvel': [],
+            'images': {'left': [], 'right': []}
+        }
+        action_data = []
+        edit_flag = 0
+
+        # 遍历轨迹中的每个步骤
+        for idx, step in enumerate(episode['steps']):
+            # 提取动作和观测数据
+            action = step['action'].numpy()[:-1]  # 排除最后一个无效数据
+            left_img = step['observation']['exterior_image_1_left'].numpy()
+            right_img = step['observation']['exterior_image_2_left'].numpy()
+            
+            # 收集数据
+            action_data.append(action)
+            state_data['images']['left'].append(left_img)
+            state_data['images']['right'].append(right_img)
+            state_data['qpos'].append(step['observation']['joint_position'].numpy())
+            state_data['qvel'].append(np.zeros(cfg['state_dim']))  # 速度数据置零
+
+            # 检查语言指令
+            if idx == 0 and len(step['language_instruction'].numpy().decode()) < 4:
+                edit_flag = 1
+                # 可视化并获取用户输入
+                combined_imgs = np.concatenate([left_img, right_img], axis=1)
+                Image.fromarray(combined_imgs).show()
+                cfg['lang_intrs'] = input("请输入任务指令: ")
+
+        # 转换为numpy数组
+        state_data['qpos'] = np.array(state_data['qpos'])
+        state_data['qvel'] = np.array(state_data['qvel'])
+        action_data = np.array(action_data)
+        
+        # 生成HDF5文件
+        generate_h5(state_data, action_data, cfg, total_traj_cnt, act_root_dir_path, edit_flag)
+        total_traj_cnt += 1
