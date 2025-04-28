@@ -1,0 +1,434 @@
+import numpy as np
+import torch
+import os
+import h5py
+import pickle
+import fnmatch
+import cv2
+from time import time
+from torch.utils.data import TensorDataset, DataLoader
+import torchvision.transforms as transforms
+
+import IPython
+from data_utils.processor import preprocess, preprocess_multimodal
+import copy
+e = IPython.embed  # 用于调试的嵌入式Python解释器
+
+def flatten_list(l):
+    """展平嵌套列表"""
+    return [item for sublist in l for item in sublist]
+
+class EpisodicDataset(torch.utils.data.Dataset):
+    """处理序列数据的Dataset类，支持多模态数据加载和预处理"""
+    def __init__(self, dataset_path_list, camera_names, norm_stats, episode_ids, episode_len, chunk_size, policy_class, llava_pythia_process=None, imsize=480):
+        """
+        初始化数据集
+        Args:
+            dataset_path_list: HDF5文件路径列表
+            camera_names: 使用的摄像头名称列表
+            norm_stats: 数据标准化统计量
+            episode_ids: 要加载的episode索引列表
+            episode_len: 每个episode的长度列表
+            chunk_size: 每个训练样本的时间步长
+            policy_class: 策略类别（影响数据处理方式）
+            llava_pythia_process: 数据后处理器对象
+            imsize: 图像目标尺寸
+        """
+        super().__init__()
+        # 初始化基本参数
+        self.episode_ids = episode_ids
+        self.dataset_path_list = dataset_path_list
+        self.camera_names = camera_names
+        self.norm_stats = norm_stats
+        self.episode_len = episode_len
+        self.chunk_size = chunk_size
+        self.cumulative_len = np.cumsum(self.episode_len)  # 累积长度用于快速定位
+        self.max_episode_len = max(episode_len)
+        self.policy_class = policy_class
+        self.llava_pythia_process = llava_pythia_process
+        self.imsize = imsize
+        
+        # 初始化图像增强策略
+        if 'diffusion' in self.policy_class:
+            self.augment_images = True  # 扩散模型需要数据增强
+        else:
+            self.augment_images = False
+        self.transformations = None  # 延迟初始化图像变换
+
+        # 初始化验证
+        a = self.__getitem__(0)  # 触发变换初始化
+        if len(a['image_top'].shape) == 4:
+            print("检测到三视图数据: 左, 右, 顶")
+        self.is_sim = False  # 是否为仿真数据标志
+
+    def __len__(self):
+        """返回数据集总长度（所有episode长度之和）"""
+        return sum(self.episode_len)
+
+    def _locate_transition(self, index):
+        """定位索引对应的episode和时间步"""
+        assert index < self.cumulative_len[-1]
+        # 二分查找定位episode
+        episode_index = np.argmax(self.cumulative_len > index)  
+        start_ts = index - (self.cumulative_len[episode_index] - self.episode_len[episode_index])
+        episode_id = self.episode_ids[episode_index]
+        return episode_id, start_ts
+
+    def __getitem__(self, index):
+        """获取单个训练样本"""
+        # 定位数据位置
+        episode_id, start_ts = self._locate_transition(index)
+        dataset_path = self.dataset_path_list[episode_id]
+
+        with h5py.File(dataset_path, 'r') as root:
+            # 读取元数据
+            try:
+                is_sim = root.attrs['sim']
+            except:
+                is_sim = False
+            compressed = root.attrs.get('compress', False)
+
+            # 读取语言指令
+            raw_lang = root['language_raw'][0].decode('utf-8')
+
+            # 读取动作数据
+            action = root['/action'][()]
+            original_action_shape = action.shape
+            episode_len = original_action_shape[0]
+
+            # 读取当前时刻观测数据
+            qpos = root['/observations/qpos'][start_ts]  # 关节位置
+            qvel = root['/observations/qvel'][start_ts]  # 关节速度（未使用）
+            
+            # 多摄像头图像处理
+            image_dict = dict()
+            for cam_name in self.camera_names:
+                img = root[f'/observations/images/{cam_name}'][start_ts]
+                # 统一图像尺寸
+                if self.imsize != img.shape[1]:
+                    img = cv2.resize(img, (320, 180))  # OpenCV尺寸顺序为(width, height)
+                # 处理压缩图像
+                if compressed:
+                    img = cv2.imdecode(img, 1)
+                image_dict[cam_name] = np.array(img)
+
+            # 动作序列截取
+            if is_sim:
+                action = action[start_ts:]
+            else:
+                action = action[max(0, start_ts - 1):]  # 真实数据对齐策略
+
+        # 构建填充后的动作序列
+        padded_action = np.zeros((self.max_episode_len, original_action_shape[1]), dtype=np.float32)
+        valid_len = len(action)
+        padded_action[:valid_len] = action
+        is_pad = np.zeros(self.max_episode_len)
+        is_pad[valid_len:] = 1  # 填充标记
+
+        # 截取指定时间窗口
+        padded_action = padded_action[:self.chunk_size]
+        is_pad = is_pad[:self.chunk_size]
+
+        # 组织多视角图像数据
+        all_cam_images = []
+        for cam_name in self.camera_names:
+            all_cam_images.append(image_dict[cam_name])
+        all_cam_images = np.stack(all_cam_images, axis=0)  # (num_cams, H, W, C)
+
+        # 转换为PyTorch张量
+        image_data = torch.from_numpy(all_cam_images)
+        qpos_data = torch.from_numpy(qpos).float()
+        action_data = torch.from_numpy(padded_action).float()
+        is_pad = torch.from_numpy(is_pad).bool()
+
+        # 特殊摄像头处理（顶视摄像头BGR转RGB）
+        if 'top' in self.camera_names:
+            image_data = torch.stack([
+                torch.from_numpy(cv2.cvtColor(img.numpy(), cv2.COLOR_BGR2RGB)) 
+                for img in image_data
+            ], dim=0)
+
+        # 调整图像维度顺序为 (num_cams, C, H, W)
+        image_data = torch.einsum('k h w c -> k c h w', image_data)
+
+        # 初始化图像增强变换（延迟加载）
+        if self.transformations is None and self.augment_images:
+            print('初始化图像增强变换')
+            original_size = image_data.shape[2:]
+            ratio = 0.95
+            self.transformations = [
+                transforms.RandomCrop(size=[int(original_size[0]*ratio), int(original_size[1]*ratio)]),
+                transforms.Resize(original_size, antialias=True),
+                transforms.RandomRotation(degrees=[-5.0, 5.0], expand=False),
+                transforms.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5)
+            ]
+
+        # 应用图像增强
+        if self.augment_images:
+            for transform in self.transformations:
+                image_data = transform(image_data)
+
+        # 图像归一化 [0, 1]
+        image_data = image_data / 255.0
+
+        # 数据标准化
+        if 'diffusion' in self.policy_class:
+            # 扩散模型：动作归一化到[-1, 1]
+            action_data = (action_data - self.norm_stats["action_min"]) / \
+                        (self.norm_stats["action_max"] - self.norm_stats["action_min"]) * 2 - 1
+        else:
+            # 常规模型：Z-score标准化
+            action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
+        
+        # 关节位置标准化
+        qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
+
+        # 组织样本数据
+        sample = {
+            'image': image_data,
+            'state': qpos_data,
+            'action': action_data,
+            'is_pad': is_pad,
+            'raw_lang': raw_lang
+        }
+
+        # 后处理（如LLaVA-Pythia模型专用处理）
+        if self.llava_pythia_process:
+            return self.llava_pythia_process.forward_process(sample)
+        return sample
+
+class LlavaPythiaProcess:
+    """LLaVA-Pythia模型专用数据处理器"""
+    def __init__(self, data_args=None, tokenizer=None, language=None):
+        """
+        初始化处理器
+        Args:
+            data_args: 数据参数配置对象
+            tokenizer: 文本分词器
+            language: 语言设置（暂未使用）
+        """
+        self.data_args = data_args
+        self.processor = data_args.image_processor  # 图像处理器
+        self.tokenizer = tokenizer
+
+    def parse_image(self, image_file):
+        """批处理图像预处理"""
+        if isinstance(image_file, torch.Tensor):
+            image = image_file.permute(0, 2, 3, 1).numpy()  # (B, H, W, C)
+        
+        # 长宽比填充处理
+        if self.data_args.image_aspect_ratio == 'pad':
+            def expand2square_batch_numpy(imgs, background_color):
+                """批量填充图像为正方形"""
+                batch_size, h, w, c = imgs.shape
+                max_dim = max(h, w)
+                expanded = np.full((batch_size, max_dim, max_dim, c), background_color, dtype=np.float32)
+                
+                # 计算填充位置
+                if h > w:
+                    offset = (max_dim - w) // 2
+                    expanded[:, :, offset:offset+w] = imgs
+                else:
+                    offset = (max_dim - h) // 2
+                    expanded[:, offset:offset+h, :] = imgs
+                return expanded
+            
+            image = expand2square_batch_numpy(image, self.processor.image_mean)
+        
+        # 应用图像处理器
+        return self.processor.preprocess(image, return_tensors='pt')['pixel_values']
+
+    def forward_process(self, sample):
+        """完整数据处理流程"""
+        # 组织对话格式
+        sources = self.datastruct_droid2llava(sample)
+        # 图像预处理
+        image = self.parse_image(sample['image'])
+        
+        # 多模态数据预处理
+        sources = preprocess_multimodal(
+            copy.deepcopy([e["conversations"] for e in sources]),
+            self.data_args)
+        
+        # 文本分词处理
+        data_dict = preprocess(sources, self.tokenizer, has_image=True)
+        data_dict = {
+            'input_ids': data_dict["input_ids"][0],
+            'labels': data_dict["labels"][0]
+        }
+
+        # 多视角图像分拆
+        images_all = torch.chunk(image, image.shape[0], dim=0)
+        data_dict.update({
+            'image': images_all[0],    # 左视图
+            'image_r': images_all[1], # 右视图
+            'state': sample['state'],  # 机器人状态
+            'action': sample['action'],  # 动作数据
+            'is_pad': sample['is_pad']  # 填充标记
+        })
+        # 顶视图处理（如果存在）
+        if image.shape[0] == 3:
+            data_dict['image_top'] = images_all[2]
+        
+        return data_dict
+
+    def datastruct_droid2llava(self, sample):
+        """转换DROID数据格式为LLaVA格式"""
+        return {
+            'id': "",
+            'image': None,
+            'state': sample['state'],
+            'action': sample['action'],
+            "conversations": [
+                {"from": "human", "value": f"<image>\n{sample['raw_lang']}"},
+                {"from": "gpt", "value": " "}
+            ]
+        }
+
+def get_norm_stats(dataset_path_list):
+    """计算数据集的标准化统计量"""
+    all_qpos, all_actions = [], []
+    episode_lens = []
+
+    # 遍历数据集计算统计量
+    for path in dataset_path_list:
+        try:
+            with h5py.File(path, 'r') as f:
+                qpos = f['/observations/qpos'][()]
+                action = f['/action'][()]
+        except Exception as e:
+            print(f'加载 {path} 失败: {e}')
+            exit()
+
+        all_qpos.append(torch.from_numpy(qpos))
+        all_actions.append(torch.from_numpy(action))
+        episode_lens.append(len(qpos))
+
+    # 合并数据
+    all_qpos = torch.cat(all_qpos)
+    all_actions = torch.cat(all_actions)
+
+    # 计算统计量
+    stats = {
+        "action_mean": all_actions.mean(dim=0).numpy(),
+        "action_std": all_actions.std(dim=0).numpy(),
+        "action_min": all_actions.min(dim=0).values.numpy() - 1e-4,
+        "action_max": all_actions.max(dim=0).values.numpy() + 1e-4,
+        "qpos_mean": all_qpos.mean(dim=0).numpy(),
+        "qpos_std": all_qpos.std(dim=0).numpy(),
+        "example_qpos": qpos  # 保留示例数据
+    }
+    # 标准差截断（防止除零）
+    stats["action_std"] = np.clip(stats["action_std"], 1e-2, np.inf)
+    stats["qpos_std"] = np.clip(stats["qpos_std"], 1e-2, np.inf)
+
+    return stats, episode_lens
+
+def find_all_hdf5(dataset_dir, skip_mirrored=False):
+    """递归查找目录下所有HDF5文件"""
+    hdf5_files = []
+    for root, _, files in os.walk(dataset_dir):
+        for f in fnmatch.filter(files, '*.hdf5'):
+            if 'features' in f: continue
+            if skip_mirrored and 'mirror' in f:
+                continue
+            hdf5_files.append(os.path.join(root, f))
+    print(f'找到 {len(hdf5_files)} 个HDF5文件')
+    return hdf5_files
+
+def load_data(dataset_dir_l, name_filter, camera_names, batch_size_train, batch_size_val, chunk_size, config, 
+             skip_mirrored=False, policy_class=None, stats_dir_l=None, sample_weights=None, 
+             train_ratio=0.99, return_dataset=False, llava_pythia_process=None):
+    """
+    主数据加载函数
+    Args:
+        dataset_dir_l: 数据集路径列表
+        name_filter: 文件名过滤函数
+        camera_names: 摄像头名称列表
+        batch_size_train: 训练批大小
+        batch_size_val: 验证批大小
+        chunk_size: 时间窗口长度
+        config: 配置字典
+        skip_mirrored: 是否跳过镜像数据
+        policy_class: 策略类别
+        stats_dir_l: 统计量计算路径
+        sample_weights: 采样权重
+        train_ratio: 训练集划分比例
+        return_dataset: 是否返回Dataset对象
+        llava_pythia_process: 数据处理器对象
+    """
+    # 数据集路径处理
+    if isinstance(dataset_dir_l, str):
+        dataset_dir_l = [dataset_dir_l]
+    dataset_paths = [find_all_hdf5(d, skip_mirrored) for d in dataset_dir_l]
+    dataset_paths = [p for p in flatten_list(dataset_paths) if name_filter(p)]
+
+    # 训练验证划分
+    num_episodes = [len(ps) for ps in dataset_paths]
+    cum_episodes = np.cumsum(num_episodes)
+    
+    # 随机打乱第一个数据集的划分
+    rng = np.random.default_rng()
+    train_ids = rng.permutation(num_episodes[0])
+    split_idx = int(train_ratio * num_episodes[0])
+    train_ids_0, val_ids_0 = train_ids[:split_idx], train_ids[split_idx:]
+
+    # 组织全局索引
+    global_train_ids = [train_ids_0] + [np.arange(n)+cum_episodes[i] for i, n in enumerate(num_episodes[1:])]
+    global_val_ids = [val_ids_0]
+
+    # 统计量计算
+    if stats_dir_l is None:
+        stats_dir_l = dataset_dir_l
+    stats, _ = get_norm_stats(flatten_list([find_all_hdf5(d, skip_mirrored) for d in stats_dir_l]))
+
+    # 创建Dataset对象
+    train_dataset = EpisodicDataset(
+        dataset_paths, camera_names, stats, 
+        flatten_list(global_train_ids), flatten_list([len(ids) for ids in global_train_ids]),
+        chunk_size, policy_class, llava_pythia_process, config['training_args'].pretrain_image_size
+    )
+    val_dataset = EpisodicDataset(
+        dataset_paths, camera_names, stats,
+        flatten_list(global_val_ids), flatten_list([len(ids) for ids in global_val_ids]),
+        chunk_size, policy_class, llava_pythia_process, config['training_args'].pretrain_image_size
+    )
+
+    # 返回结果
+    if return_dataset:
+        return train_dataset, val_dataset, stats, {
+            'train': {'batch_size': batch_size_train, 'episode_len_l': [len(ids) for ids in global_train_ids], 'sample_weights': sample_weights},
+            'eval': {'batch_size': batch_size_val, 'episode_len_l': [len(ids) for ids in global_val_ids], 'sample_weights': None}
+        }
+
+# ------------------------- 机器人控制相关工具函数 -------------------------
+def calibrate_linear_vel(action, c=0.0):
+    """线性速度校准（补偿角速度影响）"""
+    v, w = action[..., 0], action[..., 1]
+    return np.stack([v - c*w, w], axis=-1)
+
+def smooth_base_action(action, window_size=5):
+    """动作平滑（移动平均滤波）"""
+    return np.stack([
+        np.convolve(action[:,i], np.ones(window_size)/window_size, 'same') 
+        for i in range(action.shape[1])
+    ], axis=-1).astype(np.float32)
+
+def postprocess_base_action(action):
+    """动作后处理（缩放输出范围）"""
+    linear_vel, angular_vel = action
+    return np.array([linear_vel * 1.0, angular_vel * 1.0])
+
+# ------------------------- 强化学习训练工具函数 -------------------------
+def compute_dict_mean(dict_list):
+    """计算字典列表中各键的平均值"""
+    return {k: sum(d[k] for d in dict_list)/len(dict_list) for k in dict_list[0]}
+
+def detach_dict(d):
+    """断开张量的计算图"""
+    return {k: v.detach() for k, v in d.items()}
+
+def set_seed(seed):
+    """设置随机种子"""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
